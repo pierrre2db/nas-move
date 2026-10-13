@@ -58,6 +58,11 @@ class Summary:
     bytes_done: int = 0
     cancelled: bool = False
     seconds: float = 0.0
+    # activité en direct (fichier en cours)
+    current: str = ""
+    phase: str = ""
+    file_done: int = 0
+    file_size: int = 0
 
     @property
     def ok(self) -> bool:
@@ -109,15 +114,6 @@ def load_interrupted() -> Optional[Options]:
 # --------------------------------------------------------------------------
 # Outils
 # --------------------------------------------------------------------------
-def sha256_of(path: Path, check: Callable[[], None] = lambda: None) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(CHUNK):
-            check()
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def unique_name(path: Path) -> Path:
     n = 1
     while True:
@@ -170,6 +166,8 @@ class Mover:
         self.on_status = on_status
         self.summary = Summary()
         self.n_excluded = 0
+        self._base = 0
+        self._last_tick = 0.0
         self._cancel = threading.Event()
         self._running = threading.Event()
         self._running.set()
@@ -209,6 +207,27 @@ class Mover:
             log.info("Volume reconnecté, reprise.")
             self.on_status("Reconnecté, reprise")
 
+    def _tick(self, phase: str, done: int, force: bool = False) -> None:
+        """Signale l'activité en cours (limité à 4 fois/s)."""
+        now = time.monotonic()
+        if force or now - self._last_tick >= 0.25:
+            self._last_tick = now
+            self.summary.phase = phase
+            self.summary.file_done = done
+            self.on_progress(self.summary, self.summary.current)
+
+    def _hash(self, path: Path, phase: str) -> str:
+        h = hashlib.sha256()
+        done = 0
+        self._tick(phase, 0, force=True)
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK):
+                self._checkpoint()
+                h.update(chunk)
+                done += len(chunk)
+                self._tick(phase, done)
+        return h.hexdigest()
+
     # -- scan --------------------------------------------------------------
     def _excluded(self, name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in self.opts.excludes)
@@ -244,7 +263,7 @@ class Mover:
             return False
         if self.opts.verify == "size":
             return True
-        return sha256_of(s, self._checkpoint) == sha256_of(d, self._checkpoint)
+        return self._hash(s, "Comparaison : source") == self._hash(d, "Comparaison : destination")
 
     def _copy(self, s: Path, d: Path) -> int:
         d.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +283,8 @@ class Mover:
                     fout.write(chunk)
                     h.update(chunk)
                     size += len(chunk)
+                    self.summary.bytes_done = self._base + size
+                    self._tick("Copie", size, force=size == len(chunk))
                 fout.flush()
                 stage = "fsync"
                 try:
@@ -275,7 +296,7 @@ class Mover:
             stage = "vérification"
             if tmp.stat().st_size != size:
                 raise VerifyError(f"Taille incorrecte après copie : {d}")
-            if self.opts.verify == "sha256" and sha256_of(tmp, self._checkpoint) != h.hexdigest():
+            if self.opts.verify == "sha256" and self._hash(tmp, "Vérification") != h.hexdigest():
                 raise VerifyError(f"Checksum différent après copie : {d}")
             stage = "renommage"
             os.replace(tmp, d)
@@ -319,6 +340,7 @@ class Mover:
                 result = self._move_file(rel, size)
                 if result == "moved":
                     self.summary.moved += 1
+                    log.info("OK %s (%d octets)", rel, size)
                 else:
                     self.summary.skipped += 1
                     log.info("Ignoré (existe déjà, différent) : %s", rel)
@@ -404,9 +426,12 @@ class Mover:
             self.on_status("Déplacement en cours")
             for rel, size in files:
                 self._checkpoint()
-                self.on_progress(sm, rel)
+                self._base = sm.bytes_done
+                sm.current, sm.file_size, sm.file_done, sm.phase = rel, size, 0, "Préparation"
+                self._tick("Préparation", 0, force=True)
                 self._process(rel, size)
-                sm.bytes_done += size
+                sm.bytes_done = self._base + size
+            sm.current, sm.phase, sm.file_done, sm.file_size = "", "Nettoyage", 0, 0
             self.on_progress(sm, "")
             if not self.opts.keep_source:
                 self._remove_empty_dirs()

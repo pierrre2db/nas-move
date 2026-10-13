@@ -1,6 +1,7 @@
 """Interface graphique macOS (tkinter, fournie avec Python)."""
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import queue
@@ -25,6 +26,13 @@ def fmt_size(n: float) -> str:
         if n < 1024 or unit == "To":
             return f"{n:.1f} {unit}" if unit != "o" else f"{int(n)} o"
         n /= 1024
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h} h {m:02d} min" if h else (f"{m} min {s:02d} s" if m else f"{s} s")
 
 
 def setup_logging(q: queue.Queue) -> None:
@@ -83,6 +91,10 @@ class App(tk.Tk):
         self.caffeinate: subprocess.Popen | None = None
         self.paused = False
         self.t0 = 0.0
+        self.last_progress = 0.0
+        self.running = False
+        self.samples: collections.deque = collections.deque(maxlen=80)  # (t, octets de la phase)
+        self.sample_key = None
 
         self.src = tk.StringVar()
         self.dst = tk.StringVar()
@@ -93,6 +105,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
         self.after(400, self._offer_resume)
+        self.after(1000, self._heartbeat)
 
     # -- construction ------------------------------------------------------
     def _build(self) -> None:
@@ -128,12 +141,16 @@ class App(tk.Tk):
         self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", **pad)
         self.status = ttk.Label(f, text="Prêt")
         self.status.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
+        self.fprogress = ttk.Progressbar(f, mode="determinate", maximum=100)
+        self.fprogress.grid(row=8, column=0, columnspan=3, sticky="ew", **pad)
         self.current = ttk.Label(f, text="", foreground="gray")
-        self.current.grid(row=8, column=0, columnspan=3, sticky="w", **pad)
+        self.current.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
+        self.activity = ttk.Label(f, text="")
+        self.activity.grid(row=10, column=0, columnspan=3, sticky="w", **pad)
 
         box = ttk.Frame(f)
-        box.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=6)
-        f.rowconfigure(9, weight=1)
+        box.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=6)
+        f.rowconfigure(11, weight=1)
         self.text = tk.Text(box, height=10, wrap="none", state="disabled")
         sb = ttk.Scrollbar(box, command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
@@ -191,11 +208,18 @@ class App(tk.Tk):
             return
         self.mover = core.Mover(
             opts,
-            on_progress=lambda s, cur: self.q.put(("progress", (s.bytes_done, s.total_bytes, s.moved + s.skipped + len(s.errors), s.total_files, cur))),
+            on_progress=lambda s, cur: self.q.put(("progress", (
+                s.bytes_done, s.total_bytes, s.moved + s.skipped + len(s.errors), s.total_files,
+                cur, s.phase, s.file_done, s.file_size))),
             on_status=lambda m: self.q.put(("status", m)))
         self.t0 = time.time()
         self.paused = False
         self.progress["value"] = 0
+        self.fprogress["value"] = 0
+        self.samples.clear()
+        self.sample_key = None
+        self.last_progress = time.time()
+        self.running = True
         self._set_running(True)
         self._keep_awake(True)
         self.worker = threading.Thread(target=self._work, daemon=True)
@@ -246,15 +270,11 @@ class App(tk.Tk):
                 elif kind == "status":
                     self.status.configure(text=data)
                 elif kind == "progress":
-                    done, total, nf, tf, cur = data
-                    self.progress["value"] = 100 * done / total if total else 0
-                    elapsed = max(time.time() - self.t0, 1)
-                    self.status.configure(
-                        text=f"{nf}/{tf} fichiers — {fmt_size(done)} / {fmt_size(total)} — {fmt_size(done / elapsed)}/s")
-                    self.current.configure(text=cur)
+                    self._on_progress(*data)
                 elif kind == "done":
                     self._finish(data)
                 elif kind == "crash":
+                    self.running = False
                     self._set_running(False)
                     self._keep_awake(False)
                     messagebox.showerror("Erreur", f"{data}\n\nRelancez l'application pour reprendre.")
@@ -262,7 +282,49 @@ class App(tk.Tk):
             pass
         self.after(100, self._poll)
 
+    def _on_progress(self, done, total, nf, tf, cur, phase, fdone, fsize) -> None:
+        now = time.time()
+        self.last_progress = now
+        self.progress["value"] = 100 * done / total if total else 0
+        self.fprogress["value"] = 100 * fdone / fsize if fsize else 0
+        # vitesse glissante sur la phase en cours (copie ou vérification)
+        key = (cur, phase)
+        if key != self.sample_key:
+            self.samples.clear()
+            self.sample_key = key
+        self.samples.append((now, fdone))
+        speed = 0.0
+        if len(self.samples) > 1:
+            (t1, b1), (t2, b2) = self.samples[0], self.samples[-1]
+            speed = (b2 - b1) / (t2 - t1) if t2 > t1 else 0.0
+        elapsed = max(now - self.t0, 1)
+        avg = done / elapsed
+        eta = f" — reste ≈ {fmt_duration((total - done) / avg)}" if avg > 0 and total > done else ""
+        self.status.configure(
+            text=f"{nf}/{tf} fichiers — {fmt_size(done)} / {fmt_size(total)} — écoulé {fmt_duration(elapsed)}{eta}")
+        if cur:
+            self.current.configure(
+                text=f"{phase} : {cur}\n{fmt_size(fdone)} / {fmt_size(fsize)} — {fmt_size(speed)}/s")
+
+    def _heartbeat(self) -> None:
+        """Témoin d'activité : alerte si plus aucune donnée ne passe."""
+        if self.running:
+            age = time.time() - self.last_progress
+            if self.paused:
+                self.activity.configure(text="⏸ En pause", foreground="gray")
+            elif age < 15:
+                self.activity.configure(text="● Actif", foreground="#2e7d32")
+            else:
+                self.activity.configure(
+                    text=f"⚠ Aucune activité depuis {int(age)} s — NAS lent, en attente ou bloqué ?",
+                    foreground="#e65100")
+        else:
+            self.activity.configure(text="")
+        self.after(1000, self._heartbeat)
+
     def _finish(self, s: core.Summary) -> None:
+        self.running = False
+        self.fprogress["value"] = 0
         self._set_running(False)
         self._keep_awake(False)
         self.current.configure(text="")

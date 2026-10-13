@@ -106,6 +106,19 @@ class MoveTests(unittest.TestCase):
         self.assertFalse(self.src.exists())
         self.assertEqual((self.dst / "projet" / "a" / "b" / "two.txt").read_text(), "deux")
 
+    def test_live_progress(self):
+        (self.src / "big.bin").write_bytes(os.urandom(core.CHUNK * 3))
+        seen = []
+        m = core.Mover(self.opts(), on_progress=lambda s, cur: seen.append((s.bytes_done, s.phase, cur, s.file_done)))
+        m._last_tick = float("-inf")
+        s = m.run()
+        self.assertTrue(s.ok)
+        phases = {p for _, p, _, _ in seen}
+        self.assertTrue({"Copie", "Vérification"} <= phases)
+        done = [b for b, _, _, _ in seen]
+        self.assertEqual(done, sorted(done))  # jamais de recul
+        self.assertEqual(s.bytes_done, s.total_bytes)
+
     def test_empty_source_is_reported(self):
         empty = Path(self.tmp.name) / "vide"
         empty.mkdir()

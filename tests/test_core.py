@@ -119,6 +119,67 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(done, sorted(done))  # jamais de recul
         self.assertEqual(s.bytes_done, s.total_bytes)
 
+    def _big(self, n_chunks=10, extra=123):
+        core.CHUNK = 64 * 1024
+        self.addCleanup(setattr, core, "CHUNK", 4 * 1024 * 1024)
+        data = os.urandom(core.CHUNK * n_chunks + extra)
+        (self.src / "big.bin").write_bytes(data)
+        return data
+
+    def _part(self):
+        return self.dst / "projet" / ("big.bin" + core.PART_SUFFIX)
+
+    def test_resume_inside_big_file(self):
+        data = self._big()
+        out = self.dst / "projet"
+        out.mkdir()
+        self._part().write_bytes(data[: core.CHUNK * 4 + 17])  # début valide, coupé en plein bloc
+        with self.assertLogs("nas_move", "INFO") as cm:
+            s = core.Mover(self.opts()).run()
+        self.assertTrue(s.ok)
+        self.assertEqual((out / "big.bin").read_bytes(), data)
+        self.assertTrue(any("Reprise de big.bin à" in m and "à 0 octets" not in m for m in cm.output))
+        self.assertFalse(self._part().exists())
+
+    def test_resume_discards_corrupt_part(self):
+        data = self._big()
+        out = self.dst / "projet"
+        out.mkdir()
+        bad = bytearray(data[: core.CHUNK * 5])
+        bad[core.CHUNK * 2 + 10] ^= 0xFF  # octet corrompu dans le 3e bloc
+        self._part().write_bytes(bytes(bad))
+        s = core.Mover(self.opts()).run()
+        self.assertTrue(s.ok)
+        self.assertEqual((out / "big.bin").read_bytes(), data)  # le résultat final est correct
+
+    def test_part_kept_after_cancel_then_resumed(self):
+        data = self._big()
+        m = core.Mover(self.opts())
+        orig = m._tick
+
+        def tick(phase, done, force=False):
+            if phase == "Copie" and done >= core.CHUNK * 3:
+                m.cancel()
+            orig(phase, done, force)
+
+        m._tick = tick
+        s = m.run()
+        self.assertTrue(s.cancelled)
+        part = self._part()
+        self.assertTrue(part.exists())
+        self.assertGreaterEqual(part.stat().st_size, core.CHUNK * 3)
+        s2 = core.Mover(self.opts()).run()
+        self.assertTrue(s2.ok)
+        self.assertEqual((self.dst / "projet" / "big.bin").read_bytes(), data)
+
+    def test_orphan_part_removed(self):
+        out = self.dst / "projet"
+        out.mkdir()
+        orphan = out / ("fantome.txt" + core.PART_SUFFIX)
+        orphan.write_bytes(b"x")
+        core.Mover(self.opts()).run()
+        self.assertFalse(orphan.exists())
+
     def test_preflight(self):
         checks = core.preflight(self.opts())
         self.assertTrue(all(c.ok for c in checks), checks)

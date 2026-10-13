@@ -27,7 +27,8 @@ Déplace un dossier (et tous ses sous-dossiers) d'un NAS vers un autre, depuis m
 - Un fichier n'est supprimé de la source qu'**après** vérification : rien n'est perdu.
 - Relancer l'application : elle propose de **reprendre** le déplacement interrompu (mêmes dossiers, mêmes options). Seul le reste est traité.
 - Si un NAS se déconnecte pendant le transfert, l'application **attend** sa reconnexion puis continue seule.
-- Les fichiers partiels (`*.nasmove.part`) sont nettoyés à la reprise.
+- **Reprise au milieu d'un gros fichier** : en cas d'erreur réseau, d'arrêt ou de plantage, le fichier partiel (`*.nasmove.part`) est conservé. Au réessai, le début déjà copié est comparé à la source bloc par bloc (seule la partie identique est gardée), puis la copie continue là où elle s'était arrêtée. Le SHA-256 final porte sur le fichier entier.
+- Une copie dont la vérification échoue est supprimée et recommence de zéro. Les `.part` dont le fichier source n'existe plus sont nettoyés.
 
 ## Sécurités
 - Refuse : source = destination, destination dans la source, racine d'un volume, volume non monté (évite d'écrire sur le disque du Mac par erreur).

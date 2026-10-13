@@ -393,6 +393,29 @@ class Mover:
             return True
         return self._hash(s, "Comparaison : source") == self._hash(d, "Comparaison : destination")
 
+    def _resume_prefix(self, fin, fout, h) -> int:
+        """Reprise d'un .part : garde seulement le début identique à la source.
+
+        Lit la source et le .part bloc par bloc ; au premier écart, le .part est
+        tronqué à cet endroit (jamais de confiance aveugle dans un fichier partiel).
+        Retourne le nombre d'octets valides ; h a déjà absorbé ce début.
+        """
+        part_size = os.fstat(fout.fileno()).st_size
+        pos = 0
+        while pos < part_size:
+            self._checkpoint()
+            n = min(CHUNK, part_size - pos)
+            a = fin.read(n)
+            if len(a) != n or fout.read(n) != a:
+                break
+            h.update(a)
+            pos += n
+            self._tick("Reprise : contrôle du début déjà copié", pos)
+        fout.truncate(pos)
+        fout.seek(pos)
+        fin.seek(pos)
+        return pos
+
     def _copy(self, s: Path, d: Path) -> int:
         d.parent.mkdir(parents=True, exist_ok=True)
         tmp = d.with_name(d.name + PART_SUFFIX)
@@ -400,7 +423,13 @@ class Mover:
         size = 0
         stage = "ouverture"
         try:
-            with open(s, "rb") as fin, open(tmp, "wb") as fout:
+            resuming = tmp.exists() and tmp.stat().st_size > 0
+            with open(s, "rb") as fin, open(tmp, "r+b" if resuming else "wb") as fout:
+                if resuming:
+                    stage = "reprise du fichier partiel"
+                    size = self._resume_prefix(fin, fout, h)
+                    self.summary.bytes_done = self._base + size
+                    log.info("Reprise de %s à %d octets", d.name, size)
                 while True:
                     stage = "lecture source"
                     chunk = fin.read(CHUNK)
@@ -432,16 +461,18 @@ class Mover:
                 os.utime(d, ns=(s.stat().st_atime_ns, s.stat().st_mtime_ns))
             except OSError:
                 pass  # certains NAS refusent la modification des dates
+        except VerifyError:
+            # copie corrompue : on repart de zéro au prochain essai
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
         except OSError as e:
-            if not isinstance(e, VerifyError) and e.strerror:
+            # erreur réseau/E-S : le .part est CONSERVÉ pour reprendre où on s'est arrêté
+            if e.strerror:
                 e.strerror = f"[{stage}, {size} octets copiés] {e.strerror}"
             raise
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
         return size
 
     def _move_file(self, rel: str, size: int) -> str:
@@ -486,17 +517,24 @@ class Mover:
                 time.sleep(2 * attempt)
 
     # -- nettoyage ---------------------------------------------------------
-    def _remove_stale_parts(self) -> None:
+    def _remove_orphan_parts(self) -> None:
+        """Supprime les .part dont le fichier source n'existe plus ; garde les autres (reprise)."""
         if not self.dst_root.is_dir():
             return
         for root, _, fnames in os.walk(self.dst_root):
             for name in fnames:
-                if name.endswith(PART_SUFFIX):
+                if not name.endswith(PART_SUFFIX):
+                    continue
+                part = Path(root) / name
+                rel = (part.relative_to(self.dst_root)).with_name(name[: -len(PART_SUFFIX)])
+                if not (self.src_root / rel).exists():
                     try:
-                        os.remove(os.path.join(root, name))
-                        log.info("Fichier partiel supprimé : %s", name)
+                        part.unlink()
+                        log.info("Fichier partiel orphelin supprimé : %s", name)
                     except OSError:
                         pass
+                else:
+                    log.info("Fichier partiel conservé pour reprise : %s (%d octets)", name, part.stat().st_size)
 
     def _remove_empty_dirs(self) -> None:
         for root, _, fnames in os.walk(self.src_root, topdown=False):
@@ -564,7 +602,7 @@ class Mover:
                 return sm
 
             save_state(self.opts, "running")
-            self._remove_stale_parts()
+            self._remove_orphan_parts()
             for rel in dirs:
                 self._wait_volumes()
                 (self.dst_root / rel).mkdir(parents=True, exist_ok=True)

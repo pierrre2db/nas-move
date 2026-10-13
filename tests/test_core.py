@@ -106,6 +106,13 @@ class MoveTests(unittest.TestCase):
         self.assertFalse(self.src.exists())
         self.assertEqual((self.dst / "projet" / "a" / "b" / "two.txt").read_text(), "deux")
 
+    def test_empty_source_is_reported(self):
+        empty = Path(self.tmp.name) / "vide"
+        empty.mkdir()
+        s = core.Mover(core.Options(src=str(empty), dst=str(self.dst), dry_run=True)).run()
+        self.assertFalse(s.ok)
+        self.assertIn("Aucun fichier", s.errors[0][1])
+
     def test_validation(self):
         self.assertTrue(core.validate(core.Options(src=str(self.src), dst=str(self.src / "a"))))
         self.assertTrue(core.validate(core.Options(src=str(self.src), dst=str(self.src))))

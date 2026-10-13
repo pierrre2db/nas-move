@@ -214,7 +214,13 @@ class Mover:
     def scan(self) -> tuple[list[tuple[str, int]], list[str]]:
         files: list[tuple[str, int]] = []
         dirs: list[str] = []
-        for root, dnames, fnames in os.walk(self.src_root):
+        def on_error(e: OSError) -> None:
+            # os.walk ignore les erreurs par défaut : un NAS sans autorisation
+            # macOS paraîtrait simplement vide.
+            log.error("Lecture impossible %s : %s", e.filename, e)
+            self.summary.errors.append((str(e.filename), str(e)))
+
+        for root, dnames, fnames in os.walk(self.src_root, onerror=on_error):
             self._checkpoint()
             rel_root = os.path.relpath(root, self.src_root)
             rel_root = "" if rel_root == "." else rel_root
@@ -335,8 +341,13 @@ class Mover:
     def run(self) -> Summary:
         t0 = time.time()
         sm = self.summary
+        log.info("Démarrage%s : %s -> %s (vérif=%s, conflit=%s)",
+                 " (simulation)" if self.opts.dry_run else "", self.opts.src, self.opts.dst,
+                 self.opts.verify, self.opts.on_conflict)
         problems = validate(self.opts)
         if problems:
+            for p in problems:
+                log.error(p)
             sm.errors.extend(("", p) for p in problems)
             return sm
         try:
@@ -345,6 +356,12 @@ class Mover:
             sm.total_files = len(files)
             sm.total_bytes = sum(sz for _, sz in files)
             log.info("%d fichiers, %d octets à traiter", sm.total_files, sm.total_bytes)
+            if not files:
+                msg = ("Aucun fichier trouvé dans la source. Dossier vide, ou accès refusé par macOS : "
+                       "Réglages Système > Confidentialité et sécurité > Accès aux fichiers et dossiers "
+                       "(ou Accès complet au disque) > autoriser Terminal.")
+                log.error(msg)
+                sm.errors.append(("", msg))
             if self.opts.dry_run:
                 for rel, _ in files:
                     d = self.dst_root / rel

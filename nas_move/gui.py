@@ -43,6 +43,7 @@ def setup_logging(q: queue.Queue) -> None:
     lg.setLevel(logging.INFO)
     lg.addHandler(fh)
     lg.addHandler(qh)
+    lg.info("NAS Move démarré (journal : %s)", core.STATE_DIR / "nasmove.log")
 
 
 def choose_folder(start: str) -> str | None:

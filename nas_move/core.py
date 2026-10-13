@@ -168,6 +168,7 @@ class Mover:
         self.on_progress = on_progress
         self.on_status = on_status
         self.summary = Summary()
+        self.n_excluded = 0
         self._cancel = threading.Event()
         self._running = threading.Event()
         self._running.set()
@@ -227,6 +228,7 @@ class Mover:
             dirs.append(rel_root)
             for name in fnames:
                 if self._excluded(name):
+                    self.n_excluded += 1
                     continue
                 rel = os.path.join(rel_root, name)
                 try:
@@ -355,9 +357,11 @@ class Mover:
             files, dirs = self.scan()
             sm.total_files = len(files)
             sm.total_bytes = sum(sz for _, sz in files)
-            log.info("%d fichiers, %d octets à traiter", sm.total_files, sm.total_bytes)
+            log.info("%d fichiers, %d octets à traiter (%d dossiers parcourus, %d fichiers exclus)",
+                     sm.total_files, sm.total_bytes, len(dirs), self.n_excluded)
             if not files:
-                msg = ("Aucun fichier trouvé dans la source. Dossier vide, ou accès refusé par macOS : "
+                msg = (f"Aucun fichier trouvé ({len(dirs)} dossiers parcourus, {self.n_excluded} fichiers exclus). "
+                       "Dossier vide, ou accès refusé par macOS : "
                        "Réglages Système > Confidentialité et sécurité > Accès aux fichiers et dossiers "
                        "(ou Accès complet au disque) > autoriser Terminal.")
                 log.error(msg)

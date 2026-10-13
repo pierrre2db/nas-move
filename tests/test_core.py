@@ -119,6 +119,20 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(done, sorted(done))  # jamais de recul
         self.assertEqual(s.bytes_done, s.total_bytes)
 
+    def test_preflight(self):
+        checks = core.preflight(self.opts())
+        self.assertTrue(all(c.ok for c in checks), checks)
+        self.assertTrue(any("écriture" in c.label for c in checks))
+        self.assertEqual(list(self.dst.glob(".nasmove_test_*")), [])  # fichier test supprimé
+        bad = core.check_location("/Volumes/__absent__/x", "Source", write=False)
+        self.assertFalse(bad[0].ok)
+
+    def test_timeout_helper(self):
+        import time as _t
+        with self.assertRaises(TimeoutError):
+            core.run_with_timeout(lambda: _t.sleep(2), 0.1)
+        self.assertEqual(core.run_with_timeout(lambda: 7, 1), 7)
+
     def test_empty_source_is_reported(self):
         empty = Path(self.tmp.name) / "vide"
         empty.mkdir()

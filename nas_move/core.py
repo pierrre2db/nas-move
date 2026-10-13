@@ -13,6 +13,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -87,6 +89,113 @@ def volume_connected(path) -> bool:
     """
     root = volume_root(path)
     return root is None or (root.is_dir() and os.path.ismount(root))
+
+
+@dataclass
+class Check:
+    label: str
+    ok: bool
+    detail: str = ""
+
+
+def run_with_timeout(fn: Callable, timeout: float):
+    """Exécute fn dans un fil : un NAS bloqué ne doit pas figer le programme."""
+    box: dict = {}
+
+    def target():
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["e"] = e
+
+    th = threading.Thread(target=target, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        raise TimeoutError(f"pas de réponse après {int(timeout)} s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
+def mount_info(path) -> Optional[str]:
+    """Ex. '//user@192.168.1.5/Backup (smbfs)' pour un volume monté, sinon None."""
+    root = volume_root(path)
+    if root is None:
+        return None
+    try:
+        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        if f" on {root} (" in line:
+            src, rest = line.split(f" on {root} (", 1)
+            return f"{src} ({rest.split(',')[0].rstrip(')')})"
+    return None
+
+
+def responsive(path, timeout: float = 30) -> bool:
+    try:
+        run_with_timeout(lambda: os.listdir(path), timeout)
+        return True
+    except (OSError, TimeoutError):
+        return False
+
+
+def check_location(path, label: str, write: bool, timeout: float = 60) -> list[Check]:
+    """Vérifie qu'un emplacement est monté, répond, et (destination) accepte l'écriture."""
+    checks: list[Check] = []
+    root = volume_root(path)
+    if root is not None:
+        mounted = volume_connected(path)
+        info = mount_info(path) if mounted else None
+        checks.append(Check(f"{label} : volume {root.name} monté", mounted,
+                            info or ("" if mounted else "non monté : le connecter dans le Finder")))
+        if not mounted:
+            return checks
+    t0 = time.monotonic()
+    try:
+        n = run_with_timeout(lambda: len(os.listdir(path)), timeout)
+        checks.append(Check(f"{label} : lecture du dossier", True,
+                            f"{n} éléments, réponse en {time.monotonic() - t0:.1f} s"))
+    except (OSError, TimeoutError) as e:
+        checks.append(Check(f"{label} : lecture du dossier", False, str(e)))
+        return checks
+    if write:
+        probe = Path(path) / f".nasmove_test_{os.getpid()}"
+        data = os.urandom(256 * 1024)
+
+        def roundtrip():
+            with open(probe, "wb") as f:
+                f.write(data)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            ok = probe.read_bytes() == data
+            probe.unlink()
+            return ok
+
+        t0 = time.monotonic()
+        try:
+            ok = run_with_timeout(roundtrip, timeout)
+            checks.append(Check(f"{label} : écriture + relecture", bool(ok),
+                                f"256 Ko en {time.monotonic() - t0:.1f} s" if ok else "données relues différentes"))
+        except (OSError, TimeoutError) as e:
+            checks.append(Check(f"{label} : écriture + relecture", False, str(e)))
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    return checks
+
+
+def preflight(opts: "Options") -> list[Check]:
+    """Contrôles de départ : les deux NAS sont-ils connectés et fonctionnels ?"""
+    checks = check_location(opts.src, "Source", write=False)
+    checks += check_location(opts.dst, "Destination", write=not opts.dry_run)
+    return checks
 
 
 def save_state(opts: Options, status: str) -> None:
@@ -192,12 +301,22 @@ class Mover:
             if self._cancel.is_set():
                 raise Cancelled
 
-    def _wait_volumes(self) -> None:
-        """Bloque tant qu'un NAS est démonté (reprend seul à la reconnexion)."""
+    def _wait_volumes(self, deep: bool = False) -> None:
+        """Bloque tant qu'un NAS est démonté ou muet (reprend seul à la reconnexion).
+
+        deep=True : après une erreur E/S, vérifie aussi que chaque NAS répond.
+        """
+        def healthy() -> bool:
+            if not (volume_connected(self.src_root) and volume_connected(self.dst_root)):
+                return False
+            if deep:
+                return responsive(self.src_root) and responsive(Path(self.opts.dst))
+            return True
+
         warned = False
-        while not (volume_connected(self.src_root) and volume_connected(self.dst_root)):
+        while not healthy():
             if not warned:
-                msg = "Volume déconnecté : en attente de reconnexion…"
+                msg = "NAS déconnecté ou sans réponse : en attente de reconnexion…"
                 log.warning(msg)
                 self.on_status(msg)
                 warned = True
@@ -349,6 +468,7 @@ class Mover:
                 raise
             except OSError as e:
                 log.warning("Échec %s (essai %d/%d) : %s", rel, attempt, RETRIES, e)
+                self._wait_volumes(deep=True)  # NAS toujours joignables ?
                 if attempt == RETRIES:
                     self.summary.errors.append((rel, str(e)))
                     return
@@ -394,12 +514,27 @@ class Mover:
             sm.errors.extend(("", p) for p in problems)
             return sm
         try:
+            self.on_status("Vérification des NAS…")
+            checks = preflight(self.opts)
+            for c in checks:
+                log.log(logging.INFO if c.ok else logging.ERROR, "%s %s : %s", "✔" if c.ok else "✘", c.label, c.detail)
+            failed = [c for c in checks if not c.ok]
+            if failed:
+                sm.errors.extend(("", f"{c.label} : {c.detail}") for c in failed)
+                return sm
             self.on_status("Analyse de la source…")
             files, dirs = self.scan()
             sm.total_files = len(files)
             sm.total_bytes = sum(sz for _, sz in files)
             log.info("%d fichiers, %d octets à traiter (%d dossiers parcourus, %d fichiers exclus)",
                      sm.total_files, sm.total_bytes, len(dirs), self.n_excluded)
+            free = shutil.disk_usage(self.opts.dst).free
+            log.info("Espace libre destination : %d octets", free)
+            if files and free < sm.total_bytes and not self.opts.dry_run:
+                msg = f"Espace insuffisant sur la destination : {free} octets libres, {sm.total_bytes} nécessaires."
+                log.error(msg)
+                sm.errors.append(("", msg))
+                return sm
             if not files:
                 msg = (f"Aucun fichier trouvé ({len(dirs)} dossiers parcourus, {self.n_excluded} fichiers exclus). "
                        "Dossier vide, ou accès refusé par macOS : "

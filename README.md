@@ -17,6 +17,12 @@ Déplace un dossier (et tous ses sous-dossiers) d'un NAS vers un autre, depuis m
 2. **Simulation** d'abord : liste ce qui serait fait, sans rien modifier.
 3. **Démarrer** : copie → vérification (SHA-256) → suppression du fichier source.
 
+## Contrôle des NAS (automatique au départ)
+- Bouton **Vérifier les NAS** : source et destination sont-elles montées ? répondent-elles ? la destination accepte-t-elle l'écriture (fichier test de 256 Ko écrit, relu, supprimé) ? Affiche le type de montage (ex. `smbfs`) et les temps de réponse.
+- Les mêmes contrôles tournent avant chaque Simulation/Démarrer/Reprise, plus l'espace libre sur la destination.
+- Pas de faux positif « NAS lent » : un NAS lent passe tant qu'il répond (délai max 60 s). Seule une absence de réponse ou une erreur bloque.
+- Après une erreur d'E/S pendant le transfert, le programme vérifie que les deux NAS répondent encore et attend leur retour avant de réessayer.
+
 ## Si ça plante
 - Un fichier n'est supprimé de la source qu'**après** vérification : rien n'est perdu.
 - Relancer l'application : elle propose de **reprendre** le déplacement interrompu (mêmes dossiers, mêmes options). Seul le reste est traité.

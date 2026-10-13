@@ -130,11 +130,12 @@ class App(tk.Tk):
 
         bar = ttk.Frame(f)
         bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=8)
+        self.btn_check = ttk.Button(bar, text="Vérifier les NAS", command=self._check_nas)
         self.btn_sim = ttk.Button(bar, text="Simulation", command=lambda: self._start(True))
         self.btn_go = ttk.Button(bar, text="Démarrer", command=lambda: self._start(False))
         self.btn_pause = ttk.Button(bar, text="Pause", command=self._toggle_pause, state="disabled")
         self.btn_stop = ttk.Button(bar, text="Arrêter", command=self._stop, state="disabled")
-        for b in (self.btn_sim, self.btn_go, self.btn_pause, self.btn_stop):
+        for b in (self.btn_check, self.btn_sim, self.btn_go, self.btn_pause, self.btn_stop):
             b.pack(side="left", padx=4)
 
         self.progress = ttk.Progressbar(f, mode="determinate", maximum=100)
@@ -234,6 +235,29 @@ class App(tk.Tk):
             return
         self.q.put(("done", summary))
 
+    def _check_nas(self) -> None:
+        """Teste source et destination (montage, réponse, écriture) sans rien déplacer."""
+        opts = self._read_options(False)
+        self.btn_check.configure(state="disabled")
+        self.status.configure(text="Vérification des NAS en cours…")
+
+        def work():
+            problems = core.validate(opts)
+            checks = [] if problems else core.preflight(opts)
+            self.q.put(("checked", (problems, checks)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_checks(self, problems, checks) -> None:
+        self.btn_check.configure(state="normal")
+        lines = list(problems) + [f"{'✔' if c.ok else '✘'} {c.label}" + (f" — {c.detail}" if c.detail else "") for c in checks]
+        for line in lines:
+            self._log(line)
+        ok = not problems and all(c.ok for c in checks)
+        self.status.configure(text="NAS OK" if ok else "Problème avec un NAS")
+        (messagebox.showinfo if ok else messagebox.showerror)(
+            "Vérification des NAS", "\n".join(lines) or "Rien à vérifier.")
+
     # -- contrôles ---------------------------------------------------------
     def _toggle_pause(self) -> None:
         if not self.mover:
@@ -247,6 +271,7 @@ class App(tk.Tk):
             self.mover.cancel()
 
     def _set_running(self, running: bool) -> None:
+        self.btn_check.configure(state="disabled" if running else "normal")
         self.btn_sim.configure(state="disabled" if running else "normal")
         self.btn_go.configure(state="disabled" if running else "normal")
         self.btn_pause.configure(state="normal" if running else "disabled", text="Pause")
@@ -271,6 +296,8 @@ class App(tk.Tk):
                     self.status.configure(text=data)
                 elif kind == "progress":
                     self._on_progress(*data)
+                elif kind == "checked":
+                    self._show_checks(*data)
                 elif kind == "done":
                     self._finish(data)
                 elif kind == "crash":

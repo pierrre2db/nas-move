@@ -169,14 +169,14 @@ class App(tk.Tk):
             self._launch(opts)
 
     # -- lancement ---------------------------------------------------------
-    def _options(self, dry: bool) -> core.Options:
+    def _read_options(self, dry: bool) -> core.Options:
         return core.Options(
             src=self.src.get().strip(), dst=self.dst.get().strip(),
             verify=VERIFY[self.verify.get()], on_conflict=CONFLICT[self.conflict.get()],
             keep_source=self.keep.get(), dry_run=dry)
 
     def _start(self, dry: bool) -> None:
-        opts = self._options(dry)
+        opts = self._read_options(dry)
         problems = core.validate(opts)
         if problems:
             messagebox.showerror("Impossible de démarrer", "\n".join(problems))

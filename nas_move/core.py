@@ -1,0 +1,378 @@
+"""Moteur de déplacement NAS1 -> NAS2 (sans dépendance, sans interface).
+
+Principe : copier -> vérifier -> supprimer la source. Comme un fichier n'est
+supprimé de la source qu'après vérification, la reprise après un plantage est
+simplement « relancer sur les mêmes dossiers » : ce qui reste dans la source
+est ce qui reste à faire.
+"""
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+log = logging.getLogger("nas_move")
+
+CHUNK = 4 * 1024 * 1024
+RETRIES = 3
+PART_SUFFIX = ".nasmove.part"
+DEFAULT_EXCLUDES = [".DS_Store", "._*"]
+STATE_DIR = Path.home() / "Library" / "Application Support" / "NasMove"
+STATE_FILE = STATE_DIR / "last_job.json"
+
+
+class Cancelled(Exception):
+    pass
+
+
+class VerifyError(OSError):
+    pass
+
+
+@dataclass
+class Options:
+    src: str
+    dst: str
+    verify: str = "sha256"  # "size" | "sha256"
+    on_conflict: str = "skip"  # "skip" | "overwrite" | "rename"
+    keep_source: bool = False
+    excludes: list = field(default_factory=lambda: list(DEFAULT_EXCLUDES))
+    dry_run: bool = False
+
+
+@dataclass
+class Summary:
+    total_files: int = 0
+    total_bytes: int = 0
+    moved: int = 0
+    skipped: int = 0
+    errors: list = field(default_factory=list)
+    bytes_done: int = 0
+    cancelled: bool = False
+    seconds: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors and not self.cancelled
+
+
+# --------------------------------------------------------------------------
+# Volumes macOS (/Volumes/NomDuNAS)
+# --------------------------------------------------------------------------
+def volume_root(path) -> Optional[Path]:
+    parts = Path(path).parts
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        return Path("/", "Volumes", parts[2])
+    return None
+
+
+def volume_connected(path) -> bool:
+    """Vrai si le chemin n'est pas sur un volume, ou si ce volume est monté.
+
+    Important : un NAS démonté laisse parfois un dossier vide dans /Volumes ;
+    y écrire remplirait le disque du Mac au lieu du NAS.
+    """
+    root = volume_root(path)
+    return root is None or (root.is_dir() and os.path.ismount(root))
+
+
+def save_state(opts: Options, status: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {"status": status, "time": time.time(), "options": asdict(opts)}
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:  # l'état est un confort, jamais bloquant
+        log.warning("Impossible d'écrire l'état de reprise : %s", e)
+
+
+def load_interrupted() -> Optional[Options]:
+    """Options du dernier job s'il ne s'est pas terminé proprement."""
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if data.get("status") == "finished":
+            return None
+        return Options(**data["options"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Outils
+# --------------------------------------------------------------------------
+def sha256_of(path: Path, check: Callable[[], None] = lambda: None) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            check()
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def unique_name(path: Path) -> Path:
+    n = 1
+    while True:
+        cand = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+def validate(opts: Options) -> list[str]:
+    """Retourne la liste des problèmes bloquants (vide = OK)."""
+    problems = []
+    src, dst = Path(opts.src), Path(opts.dst)
+    if not src.is_dir():
+        problems.append(f"Source introuvable : {src}")
+    if not dst.is_dir():
+        problems.append(f"Destination introuvable : {dst}")
+    if problems:
+        return problems
+    for p in (src, dst):
+        if not volume_connected(p):
+            problems.append(f"Volume non monté : {volume_root(p)}")
+    if src.parent == src or volume_root(src) == src.resolve():
+        problems.append("La source ne peut pas être la racine d'un disque/NAS.")
+    rs, rd = src.resolve(), dst.resolve()
+    if rs == rd or rs in rd.parents:
+        problems.append("La destination ne peut pas être dans la source.")
+    if opts.verify not in ("size", "sha256"):
+        problems.append("Mode de vérification invalide.")
+    if opts.on_conflict not in ("skip", "overwrite", "rename"):
+        problems.append("Politique de conflit invalide.")
+    return problems
+
+
+# --------------------------------------------------------------------------
+# Moteur
+# --------------------------------------------------------------------------
+class Mover:
+    def __init__(
+        self,
+        opts: Options,
+        on_progress: Callable[[Summary, str], None] = lambda s, cur: None,
+        on_status: Callable[[str], None] = lambda msg: None,
+    ):
+        self.opts = opts
+        self.src_root = Path(opts.src)
+        # On déplace le dossier lui-même : dst/<nom_du_dossier>/...
+        self.dst_root = Path(opts.dst) / self.src_root.name
+        self.on_progress = on_progress
+        self.on_status = on_status
+        self.summary = Summary()
+        self._cancel = threading.Event()
+        self._running = threading.Event()
+        self._running.set()
+
+    # -- contrôle ----------------------------------------------------------
+    def cancel(self) -> None:
+        self._cancel.set()
+        self._running.set()
+
+    def pause(self) -> None:
+        self._running.clear()
+
+    def resume(self) -> None:
+        self._running.set()
+
+    def _checkpoint(self) -> None:
+        if self._cancel.is_set():
+            raise Cancelled
+        if not self._running.is_set():
+            self.on_status("En pause")
+            self._running.wait()
+            if self._cancel.is_set():
+                raise Cancelled
+
+    def _wait_volumes(self) -> None:
+        """Bloque tant qu'un NAS est démonté (reprend seul à la reconnexion)."""
+        warned = False
+        while not (volume_connected(self.src_root) and volume_connected(self.dst_root)):
+            if not warned:
+                msg = "Volume déconnecté : en attente de reconnexion…"
+                log.warning(msg)
+                self.on_status(msg)
+                warned = True
+            self._checkpoint()
+            time.sleep(3)
+        if warned:
+            log.info("Volume reconnecté, reprise.")
+            self.on_status("Reconnecté, reprise")
+
+    # -- scan --------------------------------------------------------------
+    def _excluded(self, name: str) -> bool:
+        return any(fnmatch.fnmatch(name, pat) for pat in self.opts.excludes)
+
+    def scan(self) -> tuple[list[tuple[str, int]], list[str]]:
+        files: list[tuple[str, int]] = []
+        dirs: list[str] = []
+        for root, dnames, fnames in os.walk(self.src_root):
+            self._checkpoint()
+            rel_root = os.path.relpath(root, self.src_root)
+            rel_root = "" if rel_root == "." else rel_root
+            dirs.append(rel_root)
+            for name in fnames:
+                if self._excluded(name):
+                    continue
+                rel = os.path.join(rel_root, name)
+                try:
+                    files.append((rel, os.path.getsize(self.src_root / rel)))
+                except OSError as e:
+                    log.warning("Illisible (ignoré) %s : %s", rel, e)
+        return files, dirs
+
+    # -- un fichier --------------------------------------------------------
+    def _same(self, s: Path, d: Path) -> bool:
+        if s.stat().st_size != d.stat().st_size:
+            return False
+        if self.opts.verify == "size":
+            return True
+        return sha256_of(s, self._checkpoint) == sha256_of(d, self._checkpoint)
+
+    def _copy(self, s: Path, d: Path) -> int:
+        d.parent.mkdir(parents=True, exist_ok=True)
+        tmp = d.with_name(d.name + PART_SUFFIX)
+        h = hashlib.sha256()
+        size = 0
+        try:
+            with open(s, "rb") as fin, open(tmp, "wb") as fout:
+                while chunk := fin.read(CHUNK):
+                    self._checkpoint()
+                    fout.write(chunk)
+                    h.update(chunk)
+                    size += len(chunk)
+                fout.flush()
+                os.fsync(fout.fileno())
+            if tmp.stat().st_size != size:
+                raise VerifyError(f"Taille incorrecte après copie : {d}")
+            if self.opts.verify == "sha256" and sha256_of(tmp, self._checkpoint) != h.hexdigest():
+                raise VerifyError(f"Checksum différent après copie : {d}")
+            os.replace(tmp, d)
+            try:
+                os.utime(d, ns=(s.stat().st_atime_ns, s.stat().st_mtime_ns))
+            except OSError:
+                pass  # certains NAS refusent la modification des dates
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return size
+
+    def _move_file(self, rel: str, size: int) -> str:
+        """Retourne 'moved' ou 'skipped'."""
+        s, d = self.src_root / rel, self.dst_root / rel
+        if d.exists():
+            if self._same(s, d):  # déjà copié avant un plantage
+                if not self.opts.keep_source:
+                    s.unlink()
+                return "moved"
+            if self.opts.on_conflict == "skip":
+                return "skipped"
+            if self.opts.on_conflict == "rename":
+                d = unique_name(d)
+        self._copy(s, d)
+        if not self.opts.keep_source:
+            s.unlink()
+        return "moved"
+
+    def _process(self, rel: str, size: int) -> None:
+        for attempt in range(1, RETRIES + 1):
+            self._wait_volumes()
+            try:
+                result = self._move_file(rel, size)
+                if result == "moved":
+                    self.summary.moved += 1
+                else:
+                    self.summary.skipped += 1
+                    log.info("Ignoré (existe déjà, différent) : %s", rel)
+                return
+            except Cancelled:
+                raise
+            except OSError as e:
+                log.warning("Échec %s (essai %d/%d) : %s", rel, attempt, RETRIES, e)
+                if attempt == RETRIES:
+                    self.summary.errors.append((rel, str(e)))
+                    return
+                time.sleep(2 * attempt)
+
+    # -- nettoyage ---------------------------------------------------------
+    def _remove_stale_parts(self) -> None:
+        if not self.dst_root.is_dir():
+            return
+        for root, _, fnames in os.walk(self.dst_root):
+            for name in fnames:
+                if name.endswith(PART_SUFFIX):
+                    try:
+                        os.remove(os.path.join(root, name))
+                        log.info("Fichier partiel supprimé : %s", name)
+                    except OSError:
+                        pass
+
+    def _remove_empty_dirs(self) -> None:
+        for root, _, fnames in os.walk(self.src_root, topdown=False):
+            for name in fnames:
+                if self._excluded(name):
+                    try:
+                        os.remove(os.path.join(root, name))
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(root)  # échoue si non vide : voulu
+            except OSError:
+                pass
+
+    # -- run ---------------------------------------------------------------
+    def run(self) -> Summary:
+        t0 = time.time()
+        sm = self.summary
+        problems = validate(self.opts)
+        if problems:
+            sm.errors.extend(("", p) for p in problems)
+            return sm
+        try:
+            self.on_status("Analyse de la source…")
+            files, dirs = self.scan()
+            sm.total_files = len(files)
+            sm.total_bytes = sum(sz for _, sz in files)
+            log.info("%d fichiers, %d octets à traiter", sm.total_files, sm.total_bytes)
+            if self.opts.dry_run:
+                for rel, _ in files:
+                    d = self.dst_root / rel
+                    if d.exists():
+                        sm.skipped += 1
+                    else:
+                        sm.moved += 1
+                sm.seconds = time.time() - t0
+                return sm
+
+            save_state(self.opts, "running")
+            self._remove_stale_parts()
+            for rel in dirs:
+                self._wait_volumes()
+                (self.dst_root / rel).mkdir(parents=True, exist_ok=True)
+
+            self.on_status("Déplacement en cours")
+            for rel, size in files:
+                self._checkpoint()
+                self.on_progress(sm, rel)
+                self._process(rel, size)
+                sm.bytes_done += size
+            self.on_progress(sm, "")
+            if not self.opts.keep_source:
+                self._remove_empty_dirs()
+            save_state(self.opts, "finished" if not sm.errors else "running")
+        except Cancelled:
+            sm.cancelled = True
+            save_state(self.opts, "cancelled")
+        sm.seconds = time.time() - t0
+        return sm

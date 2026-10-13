@@ -1,0 +1,8 @@
+[project]
+name = "nas-move"
+version = "0.1.0"
+description = "Déplacer un dossier d'un NAS à un autre (macOS, interface graphique, reprise)"
+requires-python = ">=3.9"
+
+[project.gui-scripts]
+nas-move = "nas_move.gui:main"

@@ -7,6 +7,7 @@ est ce qui reste à faire.
 """
 from __future__ import annotations
 
+import errno
 import fnmatch
 import hashlib
 import json
@@ -250,24 +251,42 @@ class Mover:
         tmp = d.with_name(d.name + PART_SUFFIX)
         h = hashlib.sha256()
         size = 0
+        stage = "ouverture"
         try:
             with open(s, "rb") as fin, open(tmp, "wb") as fout:
-                while chunk := fin.read(CHUNK):
+                while True:
+                    stage = "lecture source"
+                    chunk = fin.read(CHUNK)
+                    if not chunk:
+                        break
                     self._checkpoint()
+                    stage = "écriture destination"
                     fout.write(chunk)
                     h.update(chunk)
                     size += len(chunk)
                 fout.flush()
-                os.fsync(fout.fileno())
+                stage = "fsync"
+                try:
+                    os.fsync(fout.fileno())
+                except OSError as e:
+                    # Certains partages SMB/NAS refusent fsync : sans gravité.
+                    if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                        raise
+            stage = "vérification"
             if tmp.stat().st_size != size:
                 raise VerifyError(f"Taille incorrecte après copie : {d}")
             if self.opts.verify == "sha256" and sha256_of(tmp, self._checkpoint) != h.hexdigest():
                 raise VerifyError(f"Checksum différent après copie : {d}")
+            stage = "renommage"
             os.replace(tmp, d)
             try:
                 os.utime(d, ns=(s.stat().st_atime_ns, s.stat().st_mtime_ns))
             except OSError:
                 pass  # certains NAS refusent la modification des dates
+        except OSError as e:
+            if not isinstance(e, VerifyError) and e.strerror:
+                e.strerror = f"[{stage}, {size} octets copiés] {e.strerror}"
+            raise
         finally:
             if tmp.exists():
                 try:

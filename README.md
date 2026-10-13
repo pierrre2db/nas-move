@@ -7,6 +7,11 @@ Déplace un dossier (et tous ses sous-dossiers) d'un NAS vers un autre, depuis m
 - Double-clic sur `NasMove.command` (ou `python3 -m nas_move` dans le Terminal).
 - Si Tk manque : `brew install python-tk` (le Python de python.org l'inclut).
 
+## Si « Choisir… » ne marche pas
+- Le sélecteur utilise la boîte de dialogue native de macOS. Au premier accès à un NAS, macOS demande l'autorisation : accepter.
+- Sinon : **Réglages Système > Confidentialité et sécurité > Accès aux fichiers et dossiers** (ou *Accès complet au disque*) et autoriser **Terminal**.
+- En dernier recours, saisir le chemin à la main dans le champ (ex. `/Volumes/NAS1/MonDossier`).
+
 ## Utilisation
 1. **Source** : le dossier à déplacer. **Destination** : le dossier où il sera placé (`Destination/<nom du dossier>/…`).
 2. **Simulation** d'abord : liste ce qui serait fait, sans rien modifier.

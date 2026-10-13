@@ -45,6 +45,31 @@ def setup_logging(q: queue.Queue) -> None:
     lg.addHandler(qh)
 
 
+def choose_folder(start: str) -> str | None:
+    """Sélecteur de dossier : boîte native macOS (osascript), repli sur Tk."""
+    if shutil.which("osascript"):
+        loc = start if os.path.isdir(start) else VOLUMES
+        script = (
+            'POSIX path of (choose folder with prompt "Choisir un dossier" '
+            f'default location (POSIX file "{loc}"))'
+        )
+        try:
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        except OSError:
+            r = None
+        if r is not None:
+            if r.returncode == 0:
+                return r.stdout.strip().rstrip("/") or "/"
+            if "-128" in r.stderr:  # annulé par l'utilisateur
+                return None
+            logging.getLogger("nas_move").warning("osascript : %s", r.stderr.strip())
+    try:
+        return filedialog.askdirectory(initialdir=start if os.path.isdir(start) else VOLUMES) or None
+    except tk.TclError as e:
+        messagebox.showerror("Sélecteur indisponible", f"{e}\n\nSaisissez le chemin à la main (ex. /Volumes/NAS1/dossier).")
+        return None
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -115,7 +140,7 @@ class App(tk.Tk):
         self.text.pack(side="left", fill="both", expand=True)
 
     def _pick(self, var: tk.StringVar) -> None:
-        d = filedialog.askdirectory(initialdir=var.get() or VOLUMES, mustexist=True)
+        d = choose_folder(var.get().strip() or VOLUMES)
         if d:
             var.set(d)
 

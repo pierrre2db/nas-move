@@ -250,6 +250,11 @@ def validate(opts: Options) -> list[str]:
     rs, rd = src.resolve(), dst.resolve()
     if rs == rd or rs in rd.parents:
         problems.append("La destination ne peut pas être dans la source.")
+    # Le dossier est déplacé vers dst/<nom> : ce chemin ne doit pas être la source elle-même
+    # (ex. source /Volumes/photo/a et destination /Volumes/photo).
+    if (rd / src.name).resolve() == rs or (
+            (rd / src.name).exists() and os.path.samefile(rd / src.name, rs)):
+        problems.append("La destination finale (destination/nom du dossier) est la source elle-même.")
     if opts.verify not in ("size", "sha256"):
         problems.append("Mode de vérification invalide.")
     if opts.on_conflict not in ("skip", "overwrite", "rename"):
@@ -365,6 +370,10 @@ class Mover:
             rel_root = os.path.relpath(root, self.src_root)
             rel_root = "" if rel_root == "." else rel_root
             dirs.append(rel_root)
+            for name in dnames:
+                if os.path.islink(os.path.join(root, name)):
+                    log.warning("Lien symbolique vers un dossier ignoré (non suivi) : %s",
+                                os.path.join(rel_root, name))
             for name in fnames:
                 if self._excluded(name):
                     self.n_excluded += 1
@@ -439,6 +448,8 @@ class Mover:
         """Retourne 'moved' ou 'skipped'."""
         s, d = self.src_root / rel, self.dst_root / rel
         if d.exists():
+            if os.path.samefile(s, d):  # garde-fou : jamais supprimer la source si c'est le même fichier
+                raise OSError(errno.EINVAL, f"Source et destination identiques : {rel}")
             if self._same(s, d):  # déjà copié avant un plantage
                 if not self.opts.keep_source:
                     s.unlink()

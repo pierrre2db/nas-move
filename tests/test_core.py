@@ -140,6 +140,14 @@ class MoveTests(unittest.TestCase):
         self.assertFalse(s.ok)
         self.assertIn("Aucun fichier", s.errors[0][1])
 
+    def test_refuse_destination_parent_of_source(self):
+        # dst/<nom> == source : l'ancienne version aurait pu supprimer la source
+        problems = core.validate(core.Options(src=str(self.src), dst=str(self.src.parent)))
+        self.assertTrue(problems)
+        s = core.Mover(core.Options(src=str(self.src), dst=str(self.src.parent))).run()
+        self.assertFalse(s.ok)
+        self.assertTrue((self.src / "top.txt").exists())
+
     def test_validation(self):
         self.assertTrue(core.validate(core.Options(src=str(self.src), dst=str(self.src / "a"))))
         self.assertTrue(core.validate(core.Options(src=str(self.src), dst=str(self.src))))
